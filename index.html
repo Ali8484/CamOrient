@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>تغيير المنظور بناءً على حركة الرأس</title>
+  <style>
+    body { margin: 0; overflow: hidden; background-color: #111; }
+    canvas { display: block; }
+    /* مؤشر لتحميل النموذج */
+    #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-family: sans-serif; }
+  </style>
+</head>
+<body>
+  <div id="loading">جاري تحميل نموذج تتبع الوجه...</div>
+
+  <!-- استيراد Three.js و MediaPipe -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+
+  <script type="module">
+    import * as THREE from 'three';
+
+    // --- 1. إعداد مشهد Three.js الأساسي ---
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    // نضع الكاميرا في موضع مبدئي. سيتم تعديلها لاحقاً.
+    camera.position.set(0, 0, 5); 
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
+
+    // إضاءة
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+    dirLight.position.set(1, 2, 4);
+    scene.add(dirLight);
+
+    // إنشاء شبكة من المكعبات لملء المشهد
+    const geometry = new THREE.BoxGeometry(0.8, 0.8, 0.8);
+    const colors = [0xff5733, 0x33ff57, 0x3357ff, 0xff33f5, 0xffd733, 0x33fff5];
+    for (let x = -2; x <= 2; x++) {
+      for (let y = -1; y <= 1; y++) {
+        for (let z = -2; z <= 2; z++) {
+          const material = new THREE.MeshStandardMaterial({ 
+            color: colors[Math.floor(Math.random() * colors.length)] 
+          });
+          const cube = new THREE.Mesh(geometry, material);
+          cube.position.set(x * 1.5, y * 1.5, z * 1.5);
+          scene.add(cube);
+        }
+      }
+    }
+
+    // --- 2. إعداد تتبع الوجه باستخدام MediaPipe ---
+    const faceMesh = new FaceMesh({ locateFile: (file) => {
+      return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+    }});
+    
+    // إعدادات النموذج: نريد تتبع نقطة واحدة فقط (طرف الأنف) للبساطة
+    faceMesh.setOptions({
+      maxNumFaces: 1,
+      refineLandmarks: false,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+
+    // متغير لتخزين موضع الأنف الطبيعي (بين -1 و 1)
+    let nosePosition = { x: 0, y: 0 };
+    let isTrackingReady = false;
+
+    faceMesh.onResults((results) => {
+      if (!isTrackingReady) {
+        document.getElementById('loading').style.display = 'none';
+        isTrackingReady = true;
+      }
+      
+      if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+        const landmarks = results.multiFaceLandmarks[0];
+        // النقطة رقم 1 في MediaPipe FaceMesh تقع تقريباً على طرف الأنف
+        const noseTip = landmarks[1]; 
+        
+        // noseTip.x و noseTip.y هما إحداثيات طبيعية بين 0 و 1
+        // نحولهما إلى نطاق [-1, 1] لسهولة الاستخدام
+        nosePosition.x = (noseTip.x - 0.5) * 2;
+        nosePosition.y = -(noseTip.y - 0.5) * 2; // عكس الإشارة لأن محور Y في Three.js للأعلى
+      }
+    });
+
+    // --- 3. تشغيل الكاميرا وبدء التغذية ---
+    async function setupCamera() {
+      const video = document.createElement('video');
+      video.style.display = 'none'; // إخفاء الفيديو
+      document.body.appendChild(video);
+      
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        video.srcObject = stream;
+        await video.play();
+        
+        // دالة مساعدة لمعالجة الإطارات
+        async function processFrame() {
+          await faceMesh.send({ image: video });
+          requestAnimationFrame(processFrame);
+        }
+        processFrame();
+        
+      } catch (err) {
+        console.error("خطأ في الوصول إلى الكاميرا:", err);
+        document.getElementById('loading').textContent = 'لم يتم السماح بالوصول إلى الكاميرا.';
+      }
+    }
+
+    // --- 4. حلقة الرسوم المتحركة ---
+    let targetCameraX = 0;
+    let targetCameraY = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // نستخدم موضع الأنف لتحديد هدف الكاميرا
+      // نضرب في معامل للتحكم في شدة الحركة (كلما زاد الرقم، زادت الإزاحة)
+      const sensitivity = 3; 
+      targetCameraX = nosePosition.x * sensitivity;
+      targetCameraY = nosePosition.y * sensitivity;
+
+      // تحريك الكاميرا بسلاسة نحو الهدف (Damping)
+      camera.position.x += (targetCameraX - camera.position.x) * 0.1;
+      camera.position.y += (targetCameraY - camera.position.y) * 0.1;
+
+      // توجيه الكاميرا نحو مركز المشهد (أو يمكن توجيهها بناءً على الحركة)
+      camera.lookAt(0, 0, 0);
+
+      renderer.render(scene, camera);
+    }
+
+    // بدء التشغيل
+    setupCamera();
+    animate();
+
+    // التعامل مع تغيير حجم النافذة
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
